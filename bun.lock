@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "pi-rollback",
+      "name": "pi-code-rollback",
       "peerDependencies": {
         "@mariozechner/pi-coding-agent": "*",
       },

@@ -1,5 +1,5 @@
 {
-  "name": "pi-rollback",
+  "name": "pi-code-rollback",
   "version": "0.1.0",
   "description": "Claude Code-style restore for pi with automatic git-backed code snapshots and restore mode selection",
   "type": "module",

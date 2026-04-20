@@ -1,8 +1,8 @@
-# pi-rollback
+# pi-code-rollback
 
 Git-backed restore for [pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent).
 
-`pi-rollback` automatically snapshots your workspace as you work, then lets you restore either:
+`pi-code-rollback` automatically snapshots your workspace as you work, then lets you restore either:
 - the conversation,
 - the code,
 - or both.
@@ -178,7 +178,7 @@ npm publish
 Then users can install it with:
 
 ```bash
-pi install npm:pi-rollback
+pi install npm:pi-code-rollback
 ```
 
 To validate locally before publishing:
