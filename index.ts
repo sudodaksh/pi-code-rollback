@@ -5,6 +5,7 @@
  * - automatically snapshots workspace state when code changes
  * - can restore conversation to any prior user prompt boundary
  * - can restore code, conversation, or both
+ * - undo last restore to recover pre-restore state
  *
  * Design:
  * - baseline snapshot is captured for the first prompt in a session branch
@@ -15,6 +16,7 @@
  * - every saved post-run snapshot is exposed as an "after prompt" restore point
  * - if a prompt did not create a new snapshot, the extension uses the nearest
  *   earlier snapshot on that branch path
+ * - before restoring code, the current state is saved so it can be undone
  *
  * Requirements:
  * - Must be inside a git repository
@@ -22,16 +24,17 @@
  * - Ignored files are preserved on restore
  *
  * Commands:
- * - /restore       Restore code + conversation to a prompt boundary
- * - /rollback      Alias for /restore
- * - /rollback-gc   Remove stale snapshot refs for the current session
+ * - /restore        Restore code + conversation to a prompt boundary
+ * - /rollback       Alias for /restore
+ * - /undo-restore   Undo the last code restore
+ * - /rollback-gc    Remove stale snapshot refs for the current session
  */
 
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, rmdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -41,6 +44,7 @@ import type {
 } from "@mariozechner/pi-coding-agent";
 
 const SNAPSHOT_TYPE = "rollback-snapshot";
+const RESTORE_EVENT_TYPE = "rollback-restore-event";
 const SNAPSHOT_REF_PREFIX = "refs/pi/rollback";
 const GIT_IDENTITY = {
 	GIT_AUTHOR_NAME: "pi rollback",
@@ -48,6 +52,10 @@ const GIT_IDENTITY = {
 	GIT_COMMITTER_NAME: "pi rollback",
 	GIT_COMMITTER_EMAIL: "pi@localhost",
 };
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 
 interface RollbackSnapshotData {
 	version: 2;
@@ -69,6 +77,25 @@ interface RollbackSnapshot {
 	data: RollbackSnapshotData;
 }
 
+interface RestoreEventData {
+	version: 2;
+	restoreEventId: string;
+	preRestoreTree: string;
+	preRestoreRef: string;
+	restoredToEntryId: string;
+	restoredToSnapshotRef?: string;
+	mode: RestoreMode;
+	kind: "restore" | "undo-restore";
+	repoRoot: string;
+	createdAt: string;
+}
+
+interface RestoreEvent {
+	entryId: string;
+	timestamp: string;
+	data: RestoreEventData;
+}
+
 interface RestorePoint {
 	kind: "before-prompt" | "after-prompt";
 	entryId: string;
@@ -82,7 +109,21 @@ interface RestorePoint {
 	resolvedSnapshot?: RollbackSnapshot;
 }
 
+interface PromptGroup {
+	userEntryId: string;
+	preview: string;
+	timestamp: string;
+	branchLabel?: string;
+	depth: number;
+	beforePoint: RestorePoint;
+	afterPoint?: RestorePoint;
+}
+
 type RestoreMode = "both" | "conversation" | "code";
+
+// ---------------------------------------------------------------------------
+// Git helpers
+// ---------------------------------------------------------------------------
 
 interface CommandResult {
 	stdout: string;
@@ -143,6 +184,10 @@ function splitNull(value: string): string[] {
 	return value.split("\0").filter((item) => item.length > 0);
 }
 
+// ---------------------------------------------------------------------------
+// Text helpers
+// ---------------------------------------------------------------------------
+
 function truncate(text: string | undefined, maxLength = 80): string | undefined {
 	const normalized = text?.replace(/\s+/g, " ").trim();
 	if (!normalized) return undefined;
@@ -171,6 +216,10 @@ function getLastMessageText(entries: SessionEntry[], role: "user" | "assistant")
 	return undefined;
 }
 
+// ---------------------------------------------------------------------------
+// Type guards
+// ---------------------------------------------------------------------------
+
 function isRollbackSnapshotData(data: unknown): data is RollbackSnapshotData {
 	if (!data || typeof data !== "object") return false;
 	const snapshot = data as Partial<RollbackSnapshotData>;
@@ -187,12 +236,42 @@ function isRollbackSnapshotData(data: unknown): data is RollbackSnapshotData {
 	);
 }
 
+function isRestoreEventData(data: unknown): data is RestoreEventData {
+	if (!data || typeof data !== "object") return false;
+	const event = data as Partial<RestoreEventData>;
+	return (
+		event.version === 2 &&
+		typeof event.restoreEventId === "string" &&
+		typeof event.preRestoreTree === "string" &&
+		typeof event.preRestoreRef === "string" &&
+		typeof event.restoredToEntryId === "string" &&
+		(event.kind === "restore" || event.kind === "undo-restore") &&
+		typeof event.repoRoot === "string" &&
+		typeof event.createdAt === "string"
+	);
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot & restore event queries
+// ---------------------------------------------------------------------------
+
 function getSnapshotEntries(ctx: ExtensionContext): RollbackSnapshot[] {
 	return ctx.sessionManager
 		.getEntries()
 		.filter((entry): entry is Extract<SessionEntry, { type: "custom" }> => entry.type === "custom")
 		.flatMap((entry) => {
 			if (entry.customType !== SNAPSHOT_TYPE || !isRollbackSnapshotData(entry.data)) return [];
+			return [{ entryId: entry.id, timestamp: entry.timestamp, data: entry.data }];
+		})
+		.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+}
+
+function getRestoreEventEntries(ctx: ExtensionContext): RestoreEvent[] {
+	return ctx.sessionManager
+		.getEntries()
+		.filter((entry): entry is Extract<SessionEntry, { type: "custom" }> => entry.type === "custom")
+		.flatMap((entry) => {
+			if (entry.customType !== RESTORE_EVENT_TYPE || !isRestoreEventData(entry.data)) return [];
 			return [{ entryId: entry.id, timestamp: entry.timestamp, data: entry.data }];
 		})
 		.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
@@ -222,6 +301,10 @@ function getExactSnapshot(ctx: ExtensionContext, targetId: string): RollbackSnap
 		.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())[0];
 }
 
+// ---------------------------------------------------------------------------
+// Path helpers
+// ---------------------------------------------------------------------------
+
 function resolveInside(repoRoot: string, relativePath: string): string {
 	const target = resolve(repoRoot, relativePath);
 	const normalizedRoot = repoRoot.endsWith(sep) ? repoRoot : `${repoRoot}${sep}`;
@@ -230,6 +313,10 @@ function resolveInside(repoRoot: string, relativePath: string): string {
 	}
 	return target;
 }
+
+// ---------------------------------------------------------------------------
+// Git tree operations
+// ---------------------------------------------------------------------------
 
 async function buildWorkingTree(repoRoot: string): Promise<string> {
 	const tempDir = await mkdtemp(join(tmpdir(), "pi-rollback-index-"));
@@ -244,11 +331,10 @@ async function buildWorkingTree(repoRoot: string): Promise<string> {
 }
 
 async function createSnapshotRef(repoRoot: string, tree: string, sessionId: string, snapshotId: string): Promise<string> {
-	const head = (await tryGit(repoRoot, ["rev-parse", "--verify", "HEAD"]))?.trim();
 	const commit = (
 		await runGit(
 			repoRoot,
-			["commit-tree", tree, ...(head ? ["-p", head] : []), "-m", `pi rollback snapshot ${snapshotId}`],
+			["commit-tree", tree, "-m", `pi rollback snapshot ${snapshotId}`],
 			GIT_IDENTITY,
 		)
 	).trim();
@@ -313,13 +399,22 @@ async function garbageCollectSnapshotRefs(ctx: ExtensionContext): Promise<number
 			.filter((snapshot) => snapshot.data.repoRoot === repoRoot)
 			.map((snapshot) => snapshot.data.ref),
 	);
+	const restoreRefs = new Set(
+		getRestoreEventEntries(ctx)
+			.filter((event) => event.data.repoRoot === repoRoot)
+			.map((event) => event.data.preRestoreRef),
+	);
 	const refs = await listSnapshotRefs(repoRoot, sessionId);
-	const staleRefs = refs.filter((ref) => !validRefs.has(ref));
+	const staleRefs = refs.filter((ref) => !validRefs.has(ref) && !restoreRefs.has(ref));
 	for (const ref of staleRefs) {
 		await runGit(repoRoot, ["update-ref", "-d", ref]);
 	}
 	return staleRefs.length;
 }
+
+// ---------------------------------------------------------------------------
+// Diff helpers
+// ---------------------------------------------------------------------------
 
 async function diffTrees(repoRoot: string, fromTree: string, toTree: string): Promise<string[]> {
 	if (fromTree === toTree) return [];
@@ -337,6 +432,29 @@ function summarizeDiff(lines: string[], maxLines = 12): string | undefined {
 	return [...shown, ...more].join("\n");
 }
 
+// ---------------------------------------------------------------------------
+// Restore operations
+// ---------------------------------------------------------------------------
+
+async function removeEmptyParents(repoRoot: string, filePaths: string[]): Promise<void> {
+	const normalRoot = repoRoot.endsWith(sep) ? repoRoot.slice(0, -1) : repoRoot;
+	const dirs = new Set<string>();
+	for (const file of filePaths) {
+		let dir = dirname(resolveInside(repoRoot, file));
+		while (dir !== normalRoot && dir.startsWith(normalRoot + sep)) {
+			dirs.add(dir);
+			dir = dirname(dir);
+		}
+	}
+	for (const dir of [...dirs].sort((a, b) => b.length - a.length)) {
+		try {
+			await rmdir(dir);
+		} catch {
+			// not empty or already removed
+		}
+	}
+}
+
 async function restoreSnapshot(repoRoot: string, ref: string): Promise<void> {
 	const tempDir = await mkdtemp(join(tmpdir(), "pi-rollback-restore-"));
 	const tempIndex = join(tempDir, "index");
@@ -351,15 +469,20 @@ async function restoreSnapshot(repoRoot: string, ref: string): Promise<void> {
 			.filter((file) => !snapshotFiles.has(file))
 			.sort((a, b) => b.length - a.length);
 
-		for (const file of filesToDelete) {
-			await rm(resolveInside(repoRoot, file), { recursive: true, force: true });
-		}
+		await Promise.all(
+			filesToDelete.map((file) => rm(resolveInside(repoRoot, file), { recursive: true, force: true })),
+		);
+		await removeEmptyParents(repoRoot, filesToDelete);
 
 		await runGit(repoRoot, ["checkout-index", "-a", "-f"], { GIT_INDEX_FILE: tempIndex });
 	} finally {
 		await rm(tempDir, { recursive: true, force: true });
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Restore point helpers
+// ---------------------------------------------------------------------------
 
 function isUserRestorePoint(entry: SessionEntry): entry is Extract<SessionEntry, { type: "message" }> {
 	return entry.type === "message" && entry.message.role === "user";
@@ -391,15 +514,6 @@ function getAfterPromptDescription(ctx: ExtensionContext, snapshot: RollbackSnap
 		label: "after prompt",
 		preview,
 	};
-}
-
-function getCodeSnapshotSummary(point: RestorePoint): string {
-	if (!point.resolvedSnapshot) return "conversation only";
-	if (point.exactSnapshot && point.resolvedSnapshot.data.kind === "baseline") {
-		return "exact pre-prompt snapshot";
-	}
-	if (point.exactSnapshot) return "exact snapshot";
-	return "earlier snapshot";
 }
 
 function getAfterRestorePoints(ctx: ExtensionCommandContext): RestorePoint[] {
@@ -456,103 +570,189 @@ function collectRestorePoints(ctx: ExtensionCommandContext): RestorePoint[] {
 	}
 
 	walk(ctx.sessionManager.getTree(), 0);
-
 	points.push(...getAfterRestorePoints(ctx));
-
 	return points.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
 }
 
-function formatRestorePoint(point: RestorePoint, index: number): string {
-	const time = new Date(point.timestamp).toLocaleString();
-	const branch = point.branchLabel ? ` [${point.branchLabel}]` : "";
-	const phase = point.kind === "after-prompt" ? "after" : "before";
-	return `${index + 1}. ${phase}: ${point.preview}${branch} — ${getCodeSnapshotSummary(point)} (${time})`;
+function collectPromptGroups(ctx: ExtensionCommandContext): PromptGroup[] {
+	const allPoints = collectRestorePoints(ctx);
+
+	const beforeByEntry = new Map<string, RestorePoint>();
+	const afterByUserEntry = new Map<string, RestorePoint>();
+
+	for (const point of allPoints) {
+		if (point.kind === "before-prompt") {
+			beforeByEntry.set(point.entryId, point);
+		} else {
+			const branch = ctx.sessionManager.getBranch(point.entryId);
+			for (let i = branch.length - 2; i >= 0; i--) {
+				if (isUserRestorePoint(branch[i])) {
+					afterByUserEntry.set(branch[i].id, point);
+					break;
+				}
+			}
+		}
+	}
+
+	const groups: PromptGroup[] = [];
+	for (const [userId, beforePoint] of beforeByEntry) {
+		groups.push({
+			userEntryId: userId,
+			preview: beforePoint.preview,
+			timestamp: beforePoint.timestamp,
+			branchLabel: beforePoint.branchLabel,
+			depth: beforePoint.depth,
+			beforePoint,
+			afterPoint: afterByUserEntry.get(userId),
+		});
+	}
+
+	return groups.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+}
+
+function formatPromptGroup(group: PromptGroup, index: number): string {
+	const time = new Date(group.timestamp).toLocaleString();
+	const branch = group.branchLabel ? ` [${group.branchLabel}]` : "";
+	const hasCode = group.beforePoint.hasSnapshot || group.afterPoint?.hasSnapshot;
+	const suffix = hasCode ? "" : " — conversation only";
+	return `${index + 1}. ${group.preview}${branch}${suffix} (${time})`;
 }
 
 async function pickRestorePoint(args: string, ctx: ExtensionCommandContext): Promise<RestorePoint | undefined> {
-	const points = collectRestorePoints(ctx);
-	if (points.length === 0) {
-		ctx.ui.notify("No restorable prompts or final states found", "warning");
+	const groups = collectPromptGroups(ctx);
+	if (groups.length === 0) {
+		ctx.ui.notify("No restorable prompts found", "warning");
 		return undefined;
 	}
+
+	let selectedGroup: PromptGroup | undefined;
 
 	const trimmedArgs = args.trim();
 	if (trimmedArgs) {
 		const numericIndex = Number.parseInt(trimmedArgs, 10);
-		if (Number.isFinite(numericIndex) && numericIndex >= 1 && numericIndex <= points.length) {
-			return points[numericIndex - 1];
+		if (Number.isFinite(numericIndex) && numericIndex >= 1 && numericIndex <= groups.length) {
+			selectedGroup = groups[numericIndex - 1];
+		} else {
+			const lower = trimmedArgs.toLowerCase();
+			selectedGroup = groups.find((group) => {
+				const haystack = `${group.preview} ${group.branchLabel ?? ""}`.toLowerCase();
+				return haystack.includes(lower) || group.userEntryId === trimmedArgs;
+			});
+		}
+	}
+
+	if (!selectedGroup) {
+		if (!ctx.hasUI) {
+			ctx.ui.notify(
+				trimmedArgs ? "No matching restore point found" : "Pass a restore point number or search term when no UI is available",
+				"warning",
+			);
+			return undefined;
 		}
 
-		const lower = trimmedArgs.toLowerCase();
-		const match = points.find((point) => {
-			const haystack = `${point.label} ${point.preview} ${point.branchLabel ?? ""}`.toLowerCase();
-			return haystack.includes(lower) || point.entryId === trimmedArgs;
-		});
-		if (match) return match;
+		const options = groups.map((group, index) => formatPromptGroup(group, index));
+		const selected = await ctx.ui.select("Pick a prompt to restore", options);
+		if (!selected) return undefined;
+
+		const selectedIndex = options.indexOf(selected);
+		if (selectedIndex < 0) return undefined;
+		selectedGroup = groups[selectedIndex];
 	}
 
-	if (!ctx.hasUI) {
-		ctx.ui.notify("Pass a restore point number or entry id when no UI is available", "warning");
-		return undefined;
+	if (selectedGroup.beforePoint && selectedGroup.afterPoint) {
+		if (!ctx.hasUI) {
+			return selectedGroup.beforePoint;
+		}
+
+		const beforeLabel = "Before — just before this prompt ran";
+		const afterLabel = "After — the saved end state after this prompt completed";
+		const choice = await ctx.ui.select(
+			`Restore: ${selectedGroup.preview}`,
+			[beforeLabel, afterLabel, "Cancel"],
+		);
+		if (!choice || choice === "Cancel") return undefined;
+		return choice === beforeLabel ? selectedGroup.beforePoint : selectedGroup.afterPoint;
 	}
 
-	const options = points.map((point, index) => formatRestorePoint(point, index));
-	const selected = await ctx.ui.select(
-		[
-			"Pick a restore point",
-			"",
-			"before: just before a prompt ran",
-			"after: the saved end state after that prompt completed",
-		].join("\n"),
-		options,
-	);
-	if (!selected) return undefined;
-
-	const selectedIndex = options.indexOf(selected);
-	return selectedIndex >= 0 ? points[selectedIndex] : undefined;
+	return selectedGroup.beforePoint ?? selectedGroup.afterPoint;
 }
 
-async function applySnapshotForTarget(
-	targetId: string,
+// ---------------------------------------------------------------------------
+// Pre-restore state capture
+// ---------------------------------------------------------------------------
+
+async function savePreRestoreState(
+	pi: ExtensionAPI,
 	ctx: ExtensionContext,
-): Promise<{ restoredCode: boolean; pointPreview?: string }> {
-	const targetEntry = ctx.sessionManager.getEntry(targetId);
-	if (!targetEntry) {
-		throw new Error("Selected restore point no longer exists");
-	}
+	options: {
+		repoRoot: string;
+		currentTree: string;
+		restoredToEntryId: string;
+		restoredToSnapshotRef?: string;
+		mode: RestoreMode;
+		kind: "restore" | "undo-restore";
+	},
+): Promise<RestoreEventData> {
+	const restoreEventId = randomUUID().slice(0, 8);
+	const ref = await createSnapshotRef(
+		options.repoRoot,
+		options.currentTree,
+		ctx.sessionManager.getSessionId(),
+		`restore-${restoreEventId}`,
+	);
 
-	const snapshot = getResolvedSnapshot(ctx, targetId);
-	const repoRoot = snapshot ? ((await getGitRoot(ctx.cwd)) ?? snapshot.data.repoRoot) : await getGitRoot(ctx.cwd);
-	const preview = describeEntry(targetEntry)?.preview;
+	const data: RestoreEventData = {
+		version: 2,
+		restoreEventId,
+		preRestoreTree: options.currentTree,
+		preRestoreRef: ref,
+		restoredToEntryId: options.restoredToEntryId,
+		restoredToSnapshotRef: options.restoredToSnapshotRef,
+		mode: options.mode,
+		kind: options.kind,
+		repoRoot: options.repoRoot,
+		createdAt: new Date().toISOString(),
+	};
 
-	if (snapshot && repoRoot) {
-		await restoreSnapshot(repoRoot, snapshot.data.ref);
-		return { restoredCode: true, pointPreview: preview };
-	}
-
-	return { restoredCode: false, pointPreview: preview };
+	pi.appendEntry(RESTORE_EVENT_TYPE, data);
+	return data;
 }
 
-async function restoreToPoint(args: string, ctx: ExtensionCommandContext): Promise<void> {
+// ---------------------------------------------------------------------------
+// Core restore logic
+// ---------------------------------------------------------------------------
+
+async function restoreToPoint(args: string, ctx: ExtensionCommandContext, pi: ExtensionAPI): Promise<void> {
+	const repoRoot = await getGitRoot(ctx.cwd);
+	if (!repoRoot) {
+		ctx.ui.notify("Not inside a git repository — restore requires git", "warning");
+		return;
+	}
+
 	const point = await pickRestorePoint(args, ctx);
 	if (!point) return;
 
 	const snapshot = point.resolvedSnapshot;
-	const repoRoot = snapshot ? ((await getGitRoot(ctx.cwd)) ?? snapshot.data.repoRoot) : await getGitRoot(ctx.cwd);
 	const targetEntry = ctx.sessionManager.getEntry(point.entryId);
-	const diffSummary =
-		snapshot && repoRoot
-			? summarizeDiff(await diffTrees(repoRoot, snapshot.data.tree, await buildWorkingTree(repoRoot)))
-			: undefined;
 	if (!targetEntry) {
 		ctx.ui.notify("Selected restore point no longer exists", "error");
 		return;
+	}
+
+	let currentTree: string | undefined;
+	if (snapshot) {
+		currentTree = await buildWorkingTree(repoRoot);
 	}
 
 	const isAfterPrompt = point.kind === "after-prompt";
 	let mode: RestoreMode = snapshot ? "both" : "conversation";
 
 	if (ctx.hasUI) {
+		const diffSummary =
+			currentTree && snapshot
+				? summarizeDiff(await diffTrees(repoRoot, snapshot.data.tree, currentTree))
+				: undefined;
+
 		const details = [
 			`Prompt: ${point.preview}`,
 			isAfterPrompt ? "Restore target: just after this prompt completed" : "Restore target: just before this prompt ran",
@@ -564,7 +764,7 @@ async function restoreToPoint(args: string, ctx: ExtensionCommandContext): Promi
 				: "Code restore: not available for this prompt",
 			`Selected: ${new Date(point.timestamp).toLocaleString()}`,
 			snapshot ? `Snapshot created: ${new Date(snapshot.timestamp).toLocaleString()}` : undefined,
-			repoRoot ? `Repository: ${repoRoot}` : undefined,
+			`Repository: ${repoRoot}`,
 			diffSummary ? "" : undefined,
 			diffSummary ? `Files that will be reverted:\n${diffSummary}` : snapshot ? "Files that will be reverted: none" : undefined,
 		]
@@ -589,7 +789,6 @@ async function restoreToPoint(args: string, ctx: ExtensionCommandContext): Promi
 		else mode = "both";
 	}
 
-	let restoredCode = false;
 	if (mode === "both" || mode === "conversation") {
 		if (!isExactConversationRestorePoint(targetEntry)) {
 			ctx.ui.notify("Only completed assistant responses and user prompts can restore conversation exactly", "warning");
@@ -604,12 +803,25 @@ async function restoreToPoint(args: string, ctx: ExtensionCommandContext): Promi
 		}
 	}
 
+	let restoredCode = false;
 	if (mode === "both" || mode === "code") {
-		const result = await applySnapshotForTarget(point.entryId, ctx);
-		restoredCode = result.restoredCode;
-		if (!restoredCode && mode === "code") {
-			ctx.ui.notify("No saved code snapshot exists for this point", "warning");
-			return;
+		if (!snapshot) {
+			if (mode === "code") {
+				ctx.ui.notify("No saved code snapshot exists for this point", "warning");
+				return;
+			}
+		} else {
+			if (!currentTree) currentTree = await buildWorkingTree(repoRoot);
+			await savePreRestoreState(pi, ctx, {
+				repoRoot,
+				currentTree,
+				restoredToEntryId: point.entryId,
+				restoredToSnapshotRef: snapshot.data.ref,
+				mode,
+				kind: "restore",
+			});
+			await restoreSnapshot(repoRoot, snapshot.data.ref);
+			restoredCode = true;
 		}
 	}
 
@@ -634,6 +846,35 @@ async function restoreToPoint(args: string, ctx: ExtensionCommandContext): Promi
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Undo restore
+// ---------------------------------------------------------------------------
+
+async function undoLastRestore(pi: ExtensionAPI, ctx: ExtensionContext): Promise<boolean> {
+	const repoRoot = await getGitRoot(ctx.cwd);
+	if (!repoRoot) throw new Error("Not inside a git repository — undo-restore requires git");
+
+	const events = getRestoreEventEntries(ctx);
+	const lastRestore = events.filter((e) => e.data.kind === "restore").at(-1);
+	if (!lastRestore) return false;
+	const currentTree = await buildWorkingTree(repoRoot);
+
+	await savePreRestoreState(pi, ctx, {
+		repoRoot,
+		currentTree,
+		restoredToEntryId: lastRestore.data.restoredToEntryId,
+		mode: "code",
+		kind: "undo-restore",
+	});
+
+	await restoreSnapshot(repoRoot, lastRestore.data.preRestoreRef);
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Extension
+// ---------------------------------------------------------------------------
+
 export default function rollbackExtension(pi: ExtensionAPI) {
 
 	pi.registerCommand("restore", {
@@ -641,7 +882,7 @@ export default function rollbackExtension(pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			try {
 				await ctx.waitForIdle();
-				await restoreToPoint(args, ctx);
+				await restoreToPoint(args, ctx, pi);
 			} catch (error) {
 				ctx.ui.notify(`Restore failed: ${(error as Error).message}`, "error");
 			}
@@ -653,9 +894,25 @@ export default function rollbackExtension(pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			try {
 				await ctx.waitForIdle();
-				await restoreToPoint(args, ctx);
+				await restoreToPoint(args, ctx, pi);
 			} catch (error) {
 				ctx.ui.notify(`Restore failed: ${(error as Error).message}`, "error");
+			}
+		},
+	});
+
+	pi.registerCommand("undo-restore", {
+		description: "Undo the last code restore",
+		handler: async (_args, ctx) => {
+			try {
+				await ctx.waitForIdle();
+				const undone = await undoLastRestore(pi, ctx);
+				ctx.ui.notify(
+					undone ? "Undo restore complete — working tree recovered" : "No restore to undo",
+					undone ? "info" : "warning",
+				);
+			} catch (error) {
+				ctx.ui.notify(`Undo restore failed: ${(error as Error).message}`, "error");
 			}
 		},
 	});
@@ -723,3 +980,23 @@ export default function rollbackExtension(pi: ExtensionAPI) {
 		}
 	});
 }
+
+// ---------------------------------------------------------------------------
+// Testing exports
+// ---------------------------------------------------------------------------
+
+export const __testing__ = {
+	buildWorkingTree,
+	createSnapshotRef,
+	persistSnapshot,
+	restoreSnapshot,
+	getSnapshotEntries,
+	getRestoreEventEntries,
+	getResolvedSnapshot,
+	getExactSnapshot,
+	savePreRestoreState,
+	undoLastRestore,
+	getGitRoot,
+	runGit,
+	GIT_IDENTITY,
+};

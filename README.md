@@ -9,67 +9,6 @@ Git-backed restore for [pi](https://github.com/badlogic/pi-mono/tree/main/packag
 
 The restore UX is built around **prompt boundaries**, which makes it much easier to understand what you are restoring.
 
-## What gets saved
-
-During a session, the extension saves git-backed snapshots at two useful boundaries:
-
-- **before:** just before a user prompt runs
-- **after:** just after a completed run finishes
-
-That means restore points map to how you actually think about work:
-- "go back to before I asked for this"
-- "go back to the finished result of that run"
-
-## Typical flow
-
-1. Work normally in a **git repository**.
-2. Ask pi to make changes.
-3. The extension captures:
-   - a **baseline** snapshot before a prompt runs
-   - a **post-run** snapshot after a completed run, but only if the workspace changed
-4. Run `/restore` when you want to go back.
-5. Pick a restore point:
-   - `before: ...` = restore to just before that prompt ran
-   - `after: ...` = restore to the saved end state after that prompt completed
-6. Pick a restore mode:
-   - **code + conversation**
-   - **conversation only**
-   - **code only**
-
-## Restore semantics
-
-### `before: <prompt>`
-
-This means **just before that prompt ran**.
-
-- **Conversation restore**: rewinds there and puts that prompt back in the editor
-- **Code restore**: restores files to the snapshot from before that prompt started
-
-### `after: <prompt>`
-
-This means **the saved completed state after that prompt finished**.
-
-- **Conversation restore**: restores the completed response after that prompt
-- **Code restore**: restores files to the exact post-run snapshot for that completed state
-
-`after:` entries are shown for saved completed runs, so you can restore either side of a run:
-- what the workspace looked like before it started
-- or what it looked like after it finished
-
-## Example
-
-Say your session looked like this:
-
-1. `a: update README.md`
-2. `b: update loop.md`
-
-Then `/restore` behaves like this:
-
-- `before: a` → restore to the original state before `README.md` changed
-- `after: a` → restore to the finished state after `README.md` changed
-- `before: b` → restore to the state after `a`, but before `b`
-- `after: b` → restore to the finished state after `b`, including `loop.md`
-
 ## Install in pi
 
 ### Install from GitHub for all projects
@@ -124,12 +63,72 @@ Start pi inside a git repository and run:
 /restore
 ```
 
-You should see the restore picker with `before:` and `after:` restore points.
+You should see the restore picker listing your prompts.
+
+## What gets saved
+
+During a session, the extension saves git-backed snapshots at two useful boundaries:
+
+- **before:** just before a user prompt runs
+- **after:** just after a completed run finishes
+
+That means restore points map to how you actually think about work:
+- "go back to before I asked for this"
+- "go back to the finished result of that run"
+
+## Typical flow
+
+1. Work normally in a **git repository**.
+2. Ask pi to make changes.
+3. The extension captures:
+   - a **baseline** snapshot before a prompt runs
+   - a **post-run** snapshot after a completed run, but only if the workspace changed
+4. Run `/restore` when you want to go back.
+5. Pick a prompt from the list.
+6. Choose **before** or **after** that prompt (if both snapshots exist).
+7. Pick a restore mode:
+   - **code + conversation**
+   - **conversation only**
+   - **code only**
+
+If you change your mind after restoring, run `/undo-restore` to recover the working tree from before the restore.
+
+## Restore semantics
+
+### Before
+
+This means **just before that prompt ran**.
+
+- **Conversation restore**: rewinds there and puts that prompt back in the editor
+- **Code restore**: restores files to the snapshot from before that prompt started
+
+### After
+
+This means **the saved completed state after that prompt finished**.
+
+- **Conversation restore**: restores the completed response after that prompt
+- **Code restore**: restores files to the exact post-run snapshot for that completed state
+
+## Example
+
+Say your session looked like this:
+
+1. `a: update README.md`
+2. `b: update loop.md`
+
+Running `/restore` and selecting prompt `a`:
+- **Before** → restore to the original state before `README.md` changed
+- **After** → restore to the finished state after `README.md` changed
+
+Selecting prompt `b`:
+- **Before** → restore to the state after `a`, but before `b`
+- **After** → restore to the finished state after `b`, including `loop.md`
 
 ## Commands
 
-- `/restore`
+- `/restore` — restore code + conversation to a prompt boundary
 - `/rollback` — alias for `/restore`
+- `/undo-restore` — undo the last code restore (recovers the working tree from before the restore)
 - `/rollback-gc` — remove stale rollback snapshot refs for the current session
 
 ## Requirements
@@ -142,7 +141,8 @@ You should see the restore picker with `before:` and `after:` restore points.
 
 - Post-run snapshots are only saved when the workspace actually changes.
 - If a prompt does not have its own exact snapshot, restore uses the nearest earlier snapshot on that branch path.
-- Snapshots are stored as git refs under `refs/pi/rollback/...`.
+- Before any code restore, the current working tree is saved so it can be undone with `/undo-restore`.
+- Snapshots are stored as orphan git commits under `refs/pi/rollback/...`.
 
 ## Package manifest
 
