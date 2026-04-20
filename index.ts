@@ -10,10 +10,9 @@
  * - baseline snapshot is captured for the first prompt in a session branch
  * - after each completed agent run, a new snapshot is saved only if the
  *   workspace tree changed
- * - restore points are mostly user messages, which restore to just before that
- *   prompt ran
- * - the session also exposes one "after prompt" restore point for the latest
- *   saved completed state
+ * - restore points include both "before prompt" and "after prompt" boundaries
+ *   so you can restore either side of a completed run
+ * - every saved post-run snapshot is exposed as an "after prompt" restore point
  * - if a prompt did not create a new snapshot, the extension uses the nearest
  *   earlier snapshot on that branch path
  *
@@ -403,28 +402,29 @@ function getCodeSnapshotSummary(point: RestorePoint): string {
 	return "earlier snapshot";
 }
 
-function getLatestAfterRestorePoint(ctx: ExtensionCommandContext): RestorePoint | undefined {
-	const latestPostRunSnapshot = getSnapshotEntries(ctx)
+function getAfterRestorePoints(ctx: ExtensionCommandContext): RestorePoint[] {
+	return getSnapshotEntries(ctx)
 		.filter((snapshot) => snapshot.data.kind === "post-run")
-		.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())[0];
-	if (!latestPostRunSnapshot) return undefined;
+		.flatMap((snapshot) => {
+			const targetEntry = ctx.sessionManager.getEntry(snapshot.data.targetId);
+			if (!targetEntry || !isAssistantRestorePoint(targetEntry)) return [];
 
-	const targetEntry = ctx.sessionManager.getEntry(latestPostRunSnapshot.data.targetId);
-	if (!targetEntry || !isAssistantRestorePoint(targetEntry)) return undefined;
-
-	const afterDescription = getAfterPromptDescription(ctx, latestPostRunSnapshot);
-	return {
-		kind: "after-prompt",
-		entryId: latestPostRunSnapshot.data.targetId,
-		depth: 0,
-		timestamp: latestPostRunSnapshot.timestamp,
-		label: afterDescription.label,
-		branchLabel: ctx.sessionManager.getLabel(latestPostRunSnapshot.data.targetId),
-		preview: afterDescription.preview,
-		exactSnapshot: true,
-		hasSnapshot: true,
-		resolvedSnapshot: latestPostRunSnapshot,
-	};
+			const afterDescription = getAfterPromptDescription(ctx, snapshot);
+			return [
+				{
+					kind: "after-prompt" as const,
+					entryId: snapshot.data.targetId,
+					depth: 0,
+					timestamp: snapshot.timestamp,
+					label: afterDescription.label,
+					branchLabel: ctx.sessionManager.getLabel(snapshot.data.targetId),
+					preview: afterDescription.preview,
+					exactSnapshot: true,
+					hasSnapshot: true,
+					resolvedSnapshot: snapshot,
+				},
+			];
+		});
 }
 
 function collectRestorePoints(ctx: ExtensionCommandContext): RestorePoint[] {
@@ -457,10 +457,7 @@ function collectRestorePoints(ctx: ExtensionCommandContext): RestorePoint[] {
 
 	walk(ctx.sessionManager.getTree(), 0);
 
-	const latestAfterPoint = getLatestAfterRestorePoint(ctx);
-	if (latestAfterPoint) {
-		points.push(latestAfterPoint);
-	}
+	points.push(...getAfterRestorePoints(ctx));
 
 	return points.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
 }
@@ -505,7 +502,7 @@ async function pickRestorePoint(args: string, ctx: ExtensionCommandContext): Pro
 			"Pick a restore point",
 			"",
 			"before: just before a prompt ran",
-			"after: the latest saved completed end state in this session",
+			"after: the saved end state after that prompt completed",
 		].join("\n"),
 		options,
 	);

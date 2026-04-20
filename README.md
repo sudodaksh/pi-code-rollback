@@ -14,11 +14,11 @@ The restore UX is built around **prompt boundaries**, which makes it much easier
 During a session, the extension saves git-backed snapshots at two useful boundaries:
 
 - **before:** just before a user prompt runs
-- **after:** the latest saved completed end state in the session
+- **after:** just after a completed run finishes
 
 That means restore points map to how you actually think about work:
 - "go back to before I asked for this"
-- "bring me back to the latest finished state"
+- "go back to the finished result of that run"
 
 ## Typical flow
 
@@ -30,7 +30,7 @@ That means restore points map to how you actually think about work:
 4. Run `/restore` when you want to go back.
 5. Pick a restore point:
    - `before: ...` = restore to just before that prompt ran
-   - `after: ...` = restore to the latest saved completed state
+   - `after: ...` = restore to the saved end state after that prompt completed
 6. Pick a restore mode:
    - **code + conversation**
    - **conversation only**
@@ -52,8 +52,9 @@ This means **the saved completed state after that prompt finished**.
 - **Conversation restore**: restores the completed response after that prompt
 - **Code restore**: restores files to the exact post-run snapshot for that completed state
 
-There is only **one** `after:` entry in the picker: the latest saved completed state in the session.
-It stays available even if you temporarily navigate back to an earlier `before:` point.
+`after:` entries are shown for saved completed runs, so you can restore either side of a run:
+- what the workspace looked like before it started
+- or what it looked like after it finished
 
 ## Example
 
@@ -65,6 +66,7 @@ Say your session looked like this:
 Then `/restore` behaves like this:
 
 - `before: a` → restore to the original state before `README.md` changed
+- `after: a` → restore to the finished state after `README.md` changed
 - `before: b` → restore to the state after `a`, but before `b`
 - `after: b` → restore to the finished state after `b`, including `loop.md`
 
