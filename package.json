@@ -1,6 +1,6 @@
 {
   "name": "pi-code-rollback",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Claude Code-style restore for pi with automatic git-backed code snapshots and restore mode selection",
   "type": "module",
   "keywords": [
@@ -21,7 +21,9 @@
   "pi": {
     "extensions": [
       "./index.ts"
-    ]
+    ],
+    "video": "https://raw.githubusercontent.com/sudodaksh/pi-code-rollback/main/docs/demo.mp4",
+    "image": "https://raw.githubusercontent.com/sudodaksh/pi-code-rollback/main/docs/demo-preview.gif"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*"

@@ -1,5 +1,14 @@
 # pi-code-rollback
 
+<p align="center">
+  <a href="https://github.com/sudodaksh/pi-code-rollback/blob/main/docs/demo.mp4">
+    <img src="https://raw.githubusercontent.com/sudodaksh/pi-code-rollback/main/docs/demo-preview.gif" alt="pi-code-rollback demo" />
+  </a>
+</p>
+<p align="center">
+  <a href="https://github.com/sudodaksh/pi-code-rollback/blob/main/docs/demo.mp4">▶ Watch the full demo video</a>
+</p>
+
 Git-backed restore for [pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent).
 
 `pi-code-rollback` automatically snapshots your workspace as you work, then lets you restore either:
@@ -11,18 +20,18 @@ The restore UX is built around **prompt boundaries**, which makes it much easier
 
 ## Install in pi
 
-### Install from GitHub for all projects
+### Install from npm for all projects
 
 ```bash
-pi install https://github.com/sudodaksh/pi-code-rollback.git
+pi install npm:pi-code-rollback
 ```
 
 This writes to your global pi settings, so the extension is available in every repo.
 
-### Install only for the current project
+### Install from npm only for the current project
 
 ```bash
-pi install -l https://github.com/sudodaksh/pi-code-rollback.git
+pi install -l npm:pi-code-rollback
 ```
 
 This writes to `.pi/settings.json` in the current project.
@@ -30,10 +39,16 @@ This writes to `.pi/settings.json` in the current project.
 ### Try it without installing
 
 ```bash
-pi -e https://github.com/sudodaksh/pi-code-rollback.git
+pi -e npm:pi-code-rollback
 ```
 
 This loads the extension for the current pi run only.
+
+### Install from GitHub instead
+
+```bash
+pi install https://github.com/sudodaksh/pi-code-rollback.git
+```
 
 ### Install from a local checkout
 
