@@ -1,20 +1,20 @@
 # pi-code-rollback
 
-<p align="center">
-  <a href="https://github.com/sudodaksh/pi-code-rollback/blob/main/docs/demo.mp4">
-    <img src="https://raw.githubusercontent.com/sudodaksh/pi-code-rollback/main/docs/demo-preview.gif" alt="pi-code-rollback demo" />
-  </a>
-</p>
-<p align="center">
-  <a href="https://github.com/sudodaksh/pi-code-rollback/blob/main/docs/demo.mp4">▶ Watch the full demo video</a>
-</p>
-
-Git-backed restore for [pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent).
+Automagic code and conversation restore for [Pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) coding agent.
 
 `pi-code-rollback` automatically snapshots your workspace as you work, then lets you restore either:
 - the conversation,
 - the code,
 - or both.
+
+
+
+<p align="center">
+  <a href="https://github.com/sudodaksh/pi-code-rollback/blob/main/docs/demo.mp4">
+    <img src="https://raw.githubusercontent.com/sudodaksh/pi-code-rollback/main/docs/demo-preview.gif" alt="pi-code-rollback demo" />
+  </a>
+</p>
+
 
 The restore UX is built around **prompt boundaries**, which makes it much easier to understand what you are restoring.
 
